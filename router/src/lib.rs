@@ -202,7 +202,13 @@ pub async fn run(
         }
     }
 
-    let max_position_embeddings = match config.max_position_embeddings {
+    // NOTE: Multimodal models such as `embedding_gemma2` define it within the `text_config` instead
+    let max_position_embeddings = match config.max_position_embeddings.or_else(|| {
+        config
+            .text_config
+            .as_ref()
+            .and_then(|text_config| text_config.max_position_embeddings)
+    }) {
         Some(max_position_embeddings) => max_position_embeddings,
         None => match config.max_trained_positions {
             Some(max_trained_positions) => max_trained_positions,
@@ -210,12 +216,20 @@ pub async fn run(
         },
     };
 
-    let base_input_length = match st_config {
-        Some(config) => config.max_seq_length,
+    let base_input_length = match st_config.and_then(|config| config.max_seq_length) {
+        Some(max_seq_length) => max_seq_length,
         None => {
-            tracing::warn!("Could not find a Sentence Transformers config");
+            tracing::warn!("Could not find the `max_seq_length` in a Sentence Transformers config");
             max_position_embeddings - position_offset
         }
+    };
+
+    // NOTE: `embedding_gemma2` defines `max_position_embeddings=262144` and no `max_seq_length`, but
+    // it supports a context length of up to 8192 tokens, as per https://huggingface.co/google/embeddinggemma-2
+    let base_input_length = if config.model_type == "embedding_gemma2" {
+        base_input_length.min(8192)
+    } else {
+        base_input_length
     };
 
     let max_input_length = if base_input_length > max_batch_tokens {
@@ -271,10 +285,12 @@ pub async fn run(
         prompts,
     );
 
-    // NOTE: `gemma3_text` won't support Float16 but only Float32, given that with `candle-cuda`
-    // feature, the default `Dtype::Float16` this overrides that to prevent issues when running a
-    // `gemma3_text` model without specifying a `--dtype`
-    let dtype = if dtype.is_none() && config.model_type == "gemma3_text" {
+    // NOTE: `gemma3_text` and `embedding_gemma2` won't support Float16 but only Float32, given that
+    // with `candle-cuda` feature, the default `Dtype::Float16` this overrides that to prevent issues
+    // when running a `gemma3_text` or `embedding_gemma2` model without specifying a `--dtype`
+    let dtype = if dtype.is_none()
+        && (config.model_type == "gemma3_text" || config.model_type == "embedding_gemma2")
+    {
         DType::Float32
     } else {
         dtype.unwrap_or_default()
@@ -480,20 +496,38 @@ pub struct ModelConfig {
     pub id2label: Option<HashMap<String, String>>,
     pub label2id: Option<HashMap<String, usize>>,
     pub auto_map: Option<HashMap<String, String>>,
+    pub text_config: Option<TextConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TextConfig {
+    pub max_position_embeddings: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PoolConfig {
+    #[serde(default)]
     pooling_mode_cls_token: bool,
+    #[serde(default)]
     pooling_mode_mean_tokens: bool,
     #[serde(default)]
     pooling_mode_lasttoken: bool,
+    // NOTE: Sentence Transformers v6 replaces the `pooling_mode_*` flags with a single `pooling_mode`
+    #[serde(default)]
+    pooling_mode: Option<String>,
 }
 
 impl TryFrom<PoolConfig> for Pool {
     type Error = anyhow::Error;
 
     fn try_from(config: PoolConfig) -> std::result::Result<Self, Self::Error> {
+        match config.pooling_mode.as_deref() {
+            Some("cls") => return Ok(Pool::Cls),
+            Some("mean") => return Ok(Pool::Mean),
+            Some("lasttoken") => return Ok(Pool::LastToken),
+            Some(_) => return Err(anyhow!("Pooling config {config:?} is not supported")),
+            None => {}
+        }
         if config.pooling_mode_cls_token {
             return Ok(Pool::Cls);
         }
@@ -509,7 +543,8 @@ impl TryFrom<PoolConfig> for Pool {
 
 #[derive(Debug, Deserialize)]
 pub struct STConfig {
-    pub max_seq_length: usize,
+    // NOTE: Sentence Transformers v6 configs may not define it, e.g. `google/embeddinggemma-2`
+    pub max_seq_length: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -725,5 +760,53 @@ impl From<ResponseMetadata> for HeaderMap {
                 .unwrap(),
         );
         headers
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pool_config_legacy() {
+        let config: PoolConfig = serde_json::from_str(
+            r#"{"word_embedding_dimension": 768, "pooling_mode_cls_token": false, "pooling_mode_mean_tokens": true}"#,
+        )
+        .unwrap();
+        assert_eq!(Pool::try_from(config).unwrap(), Pool::Mean);
+    }
+
+    #[test]
+    fn test_pool_config_sentence_transformers_v6() {
+        let config: PoolConfig = serde_json::from_str(
+            r#"{"embedding_dimension": 768, "pooling_mode": "mean", "include_prompt": true}"#,
+        )
+        .unwrap();
+        assert_eq!(Pool::try_from(config).unwrap(), Pool::Mean);
+
+        let config: PoolConfig = serde_json::from_str(r#"{"pooling_mode": "max"}"#).unwrap();
+        assert!(Pool::try_from(config).is_err());
+    }
+
+    #[test]
+    fn test_st_config_without_max_seq_length() {
+        let config: STConfig = serde_json::from_str(
+            r#"{"transformer_task": "feature-extraction", "module_output_name": "token_embeddings"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.max_seq_length, None);
+    }
+
+    #[test]
+    fn test_model_config_nested_text_config() {
+        let config: ModelConfig = serde_json::from_str(
+            r#"{"architectures": ["EmbeddingGemma2Model"], "model_type": "embedding_gemma2", "text_config": {"max_position_embeddings": 262144}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.max_position_embeddings, None);
+        assert_eq!(
+            config.text_config.and_then(|c| c.max_position_embeddings),
+            Some(262144)
+        );
     }
 }
